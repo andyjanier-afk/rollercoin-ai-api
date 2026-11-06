@@ -41,7 +41,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 CORS_ORIGINS = [
     x.strip() for x in os.getenv(
-        "CORS_ORIGINS", "http://localhost:3000,http://localhost:5173"
+        "CORS_ORIGINS", "https://rollercoin-ai-panel.vercel.app,http://localhost:3000,http://localhost:5173"
     ).split(",") if x.strip()
 ]
 CACHE_SEGUNDOS = max(0, int(os.getenv("CACHE_SEGUNDOS", "15")))
