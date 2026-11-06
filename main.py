@@ -1,11 +1,15 @@
-"""API de prediccion de expediciones de RollerCoin.
+"""RollerCoin Expedition AI v3.0.
 
-El campo 'porcentaje' se interpreta como porcentaje de supervivencia de 0 a 100,
-registrado ANTES de conocer el resultado de cada expedicion.
+- Predicciones: estimaciones estadisticas, NO resultados garantizados.
+- 'porcentaje' se recibe en escala 0..100, antes de conocer el resultado.
+- El historial de la web puede ser incompleto: NO se usan rachas como predictors.
+- La referencia es el porcentaje proporcionado por el frontend; no se
+  supone que sea un valor oficial verificado por RollerCoin.
+- Mantiene la estructura de las respuestas v2 para no romper el frontend.
 """
-
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
@@ -20,50 +24,49 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, brier_score_loss, confusion_matrix
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, brier_score_loss, confusion_matrix, log_loss
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("rollercoin-ai")
 
+VERSION = "3.0.0"
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 CORS_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv(
-        "CORS_ORIGINS",
-        "http://localhost:3000,http://localhost:5173,http://127.0.0.1:5500",
-    ).split(",")
-    if origin.strip()
+    x.strip() for x in os.getenv(
+        "CORS_ORIGINS", "http://localhost:3000,http://localhost:5173"
+    ).split(",") if x.strip()
 ]
-CACHE_SEGUNDOS = max(0, int(os.getenv("CACHE_SEGUNDOS", "60")))
+CACHE_SEGUNDOS = max(0, int(os.getenv("CACHE_SEGUNDOS", "15")))
 PAGINA = 1000
-MIN_ENTRENAMIENTO = 10
-MIN_EVALUACION = 30
+MIN_ENTRENAMIENTO = 30
+MIN_SELECCION = 145
+N_INICIAL_VALIDACION = 100
+PASO_VALIDACION = 20
+UMBRAL_MEJORA_BRIER = 0.008  # Exigir ventaja para apartarnos de la referencia
 
-# Valores de dificultad ORIENTATIVOS: no deben presentarse como oficiales.
 MAPAS_INFO = {
-    "3h": {"horas": 3, "dificultad": 2},
-    "12h": {"horas": 12, "dificultad": 5},
-    "18h": {"horas": 18, "dificultad": 8},
-    "20h": {"horas": 20, "dificultad": 6},
-    "24h Dark": {"horas": 24, "dificultad": 7},
-    "24h Beach": {"horas": 24, "dificultad": 8},
-    "30h": {"horas": 30, "dificultad": 10},
+    "3h": {"horas": 3, "dificultad_orientativa": 2},
+    "12h": {"horas": 12, "dificultad_orientativa": 5},
+    "18h": {"horas": 18, "dificultad_orientativa": 8},
+    "20h": {"horas": 20, "dificultad_orientativa": 6},
+    "24h Dark": {"horas": 24, "dificultad_orientativa": 7},
+    "24h Beach": {"horas": 24, "dificultad_orientativa": 8},
+    "30h": {"horas": 30, "dificultad_orientativa": 10},
 }
 
-COLUMNAS_NUM = [
-    "horas", "dificultad", "stats", "porcentaje_norm",
-    "ratio_stats_dif", "resultado_anterior", "racha_derrotas",
-    "tiene_historial_hamster",
-]
-
-app = FastAPI(title="RollerCoin Expedition AI API", version="2.0.0")
+app = FastAPI(title="RollerCoin Expedition AI API", version=VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_credentials=False,  # Si usas cookies/credenciales, ajusta origenes y esta opcion.
+    allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "Authorization"],
 )
@@ -73,13 +76,13 @@ class SimulacionInput(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     hamster: str = Field(min_length=1, max_length=150)
-    stats: float = Field(ge=0)
+    stats: float = Field(ge=0, le=1_000_000)
     expedicion: str
     porcentaje: float = Field(ge=0, le=100)
 
     @field_validator("hamster", "expedicion")
     @classmethod
-    def limpiar_texto(cls, texto: str) -> str:
+    def normalizar_nombre(cls, texto: str) -> str:
         texto = texto.strip()
         if not texto:
             raise ValueError("No puede estar vacio")
@@ -89,278 +92,309 @@ class SimulacionInput(BaseModel):
     @classmethod
     def comprobar_mapa(cls, mapa: str) -> str:
         if mapa not in MAPAS_INFO:
-            raise ValueError(f"Expedicion desconocida. Opciones: {', '.join(MAPAS_INFO)}")
+            raise ValueError("Mapa desconocido. Valores: " + ", ".join(MAPAS_INFO))
         return mapa
 
 
 @dataclass
 class Estado:
-    modelo: RandomForestClassifier | None
-    columnas: list[str]
-    historial: pd.DataFrame
-    evaluacion: dict[str, Any] | None
+    modelo: Pipeline | None
+    modelo_nombre: str
     estado_modelo: str
-    total_entrenamiento: int
-    filas_descartadas: int
+    historial: pd.DataFrame
+    entrenables: int
+    descartadas: int
+    evaluacion: dict[str, Any] | None
     ultimo_por_hamster: dict[str, int]
-    racha_por_hamster: dict[str, int]
-    partidas_por_hamster: dict[str, int]
+    derrotas_por_hamster: dict[str, int]
+    envios_por_hamster: dict[str, int]
+    huella: str = ""
 
 
 def interpretar_booleano(valor: Any) -> int | None:
-    """1/0 si es un resultado conocido; None si falta o no es valido."""
-    if valor is None:
+    if valor is None or pd.isna(valor):
         return None
     if isinstance(valor, (bool, np.bool_)):
         return int(valor)
     if isinstance(valor, (int, float, np.integer, np.floating)):
-        numero = float(valor)
-        if math.isfinite(numero) and numero in (0.0, 1.0):
-            return int(numero)
-        return None
+        return int(valor) if math.isfinite(float(valor)) and float(valor) in (0, 1) else None
     texto = str(valor).strip().lower()
-    if texto in {"true", "1", "1.0", "yes", "si", "sí", "vive", "vivio", "vivió"}:
+    if texto in {"true", "1", "1.0", "yes", "si", "sí", "vive", "vivió", "vivio"}:
         return 1
-    if texto in {"false", "0", "0.0", "no", "muere", "murio", "murió"}:
+    if texto in {"false", "0", "0.0", "no", "muere", "murió", "murio"}:
         return 0
     return None
 
 
 def convertir_numeros(columna: pd.Series) -> pd.Series:
-    """Acepta numeros o texto como '75', '75.5', '75,5' y '75%'."""
-    limpia = (
-        columna.astype("string")
-        .str.strip()
-        .str.replace("%", "", regex=False)
-        .str.replace(",", ".", regex=False)
-    )
+    limpia = (columna.astype("string").str.strip()
+              .str.replace("%", "", regex=False)
+              .str.replace(",", ".", regex=False))
     return pd.to_numeric(limpia, errors="coerce")
-
-
-def preparar_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Misma transformacion para entrenar y predecir."""
-    datos = df.copy()
-    datos["horas"] = datos["expedicion"].map(lambda m: MAPAS_INFO[m]["horas"])
-    datos["dificultad"] = datos["expedicion"].map(
-        lambda m: MAPAS_INFO[m]["dificultad"]
-    )
-    # La escala del porcentaje es SIEMPRE 0-100, incluso para 0.8 o 1.
-    datos["porcentaje_norm"] = datos["porcentaje"].astype(float) / 100.0
-    datos["ratio_stats_dif"] = datos["stats"] / datos["dificultad"]
-    for columna, por_defecto in (
-        ("resultado_anterior", 0),
-        ("racha_derrotas", 0),
-        ("tiene_historial_hamster", 0),
-    ):
-        if columna not in datos:
-            datos[columna] = por_defecto
-
-    numericas = datos[COLUMNAS_NUM].astype(float)
-    categorias = pd.get_dummies(
-        datos[["hamster", "expedicion"]], dtype=int
-    )
-    return pd.concat([numericas, categorias], axis=1)
-
-
-def incorporar_historial_por_hamster(
-    df_hist: pd.DataFrame,
-) -> tuple[pd.DataFrame, dict[str, int], dict[str, int]]:
-    """Calcula variables usando UNICAMENTE partidas anteriores del mismo hamster."""
-    df_hist = df_hist.copy()
-    previos, rachas, tiene_historial = [], [], []
-    ultimo: dict[str, int] = {}
-    derrotas: dict[str, int] = {}
-
-    # df_hist llega ordenado de mas antiguo a mas reciente desde Supabase.
-    for _, fila in df_hist.iterrows():
-        hamster = fila["hamster"]
-        resultado = int(fila["finalizado_int"])
-        tiene_historial.append(int(hamster in ultimo))
-        previos.append(ultimo.get(hamster, 0))
-        rachas.append(derrotas.get(hamster, 0))
-        ultimo[hamster] = resultado
-        derrotas[hamster] = derrotas.get(hamster, 0) + 1 if resultado == 0 else 0
-
-    df_hist["resultado_anterior"] = previos
-    df_hist["racha_derrotas"] = rachas
-    df_hist["tiene_historial_hamster"] = tiene_historial
-    return df_hist, ultimo, derrotas
 
 
 def consultar_expediciones() -> pd.DataFrame:
     if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError("Configura SUPABASE_URL y SUPABASE_KEY en .env")
-
+        raise RuntimeError("Faltan SUPABASE_URL o SUPABASE_KEY en Render/entorno")
     from supabase import create_client
-
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    cliente = create_client(SUPABASE_URL, SUPABASE_KEY)
     filas: list[dict[str, Any]] = []
-    desde = 0
+    inicio = 0
     while True:
-        respuesta = (
-            supabase.table("expediciones")
-            .select("*")
-            .order("fecha", desc=False)
-            .order("id", desc=False)
-            .range(desde, desde + PAGINA - 1)
-            .execute()
-        )
-        lote = respuesta.data or []
+        consulta = (cliente.table("expediciones").select("*")
+                    .order("fecha", desc=False).order("id", desc=False)
+                    .range(inicio, inicio + PAGINA - 1).execute())
+        lote = consulta.data or []
         filas.extend(lote)
         if len(lote) < PAGINA:
             break
-        desde += PAGINA
-
+        inicio += PAGINA
     return pd.DataFrame(filas)
 
 
-def construir_historial(df: pd.DataFrame) -> tuple[
-    pd.DataFrame, pd.DataFrame, dict[str, int], dict[str, int], int
-]:
-    """Separa historial finalizado para metricas del subconjunto entrenable."""
+def ordenar_registros(df: pd.DataFrame) -> pd.DataFrame:
+    # La fecha tiene precision diaria: el id desempata. No asumimos que
+    # created_at sea la hora real del resultado (importaciones masivas).
+    return df.sort_values(["fecha", "id"], kind="stable").reset_index(drop=True)
+
+
+def construir_historial(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, int]:
     if df.empty:
-        vacio = pd.DataFrame()
-        return vacio, vacio, {}, {}, 0
-
-    requeridas = {"id", "fecha", "hamster", "expedicion", "stats", "porcentaje", "finalizado"}
-    faltantes = requeridas - set(df.columns)
-    if faltantes:
-        raise ValueError(f"Faltan columnas en expediciones: {sorted(faltantes)}")
-
-    datos = df.copy()
+        return pd.DataFrame(), pd.DataFrame(), 0
+    cols = {"id", "fecha", "hamster", "expedicion", "stats", "porcentaje", "finalizado"}
+    faltan = cols - set(df.columns)
+    if faltan:
+        raise ValueError(f"Columnas faltantes en expediciones: {sorted(faltan)}")
+    datos = ordenar_registros(df.copy())
     datos["hamster"] = datos["hamster"].fillna("").astype(str).str.strip()
     datos["expedicion"] = datos["expedicion"].fillna("").astype(str).str.strip()
     datos["finalizado_int"] = datos["finalizado"].map(interpretar_booleano)
-
-    # Los registros pendientes/no interpretables no cuentan como derrotas.
-    historial = datos.loc[
-        datos["finalizado_int"].notna() & datos["hamster"].ne("")
-    ].copy()
+    historial = datos.loc[datos["finalizado_int"].notna() & datos["hamster"].ne("")].copy()
     if historial.empty:
-        vacio = pd.DataFrame()
-        return vacio, vacio, {}, {}, 0
-
+        return pd.DataFrame(), pd.DataFrame(), 0
     historial["finalizado_int"] = historial["finalizado_int"].astype(int)
-    historial, ultimos, rachas = incorporar_historial_por_hamster(historial)
-
-    entrenables = historial.copy()
-    entrenables["stats"] = convertir_numeros(entrenables["stats"])
-    entrenables["porcentaje"] = convertir_numeros(entrenables["porcentaje"])
-    valido = (
-        entrenables["expedicion"].isin(MAPAS_INFO)
-        & entrenables["stats"].notna()
-        & entrenables["stats"].ge(0)
-        & np.isfinite(entrenables["stats"])
-        & entrenables["porcentaje"].notna()
-        & entrenables["porcentaje"].between(0, 100)
-        & np.isfinite(entrenables["porcentaje"])
+    ml = historial.copy()
+    ml["stats"] = convertir_numeros(ml["stats"])
+    ml["porcentaje"] = convertir_numeros(ml["porcentaje"])
+    es_valido = (
+        ml["expedicion"].isin(MAPAS_INFO)
+        & ml["stats"].notna() & ml["stats"].between(0, 1_000_000)
+        & np.isfinite(ml["stats"].astype(float))
+        & ml["porcentaje"].notna() & ml["porcentaje"].between(0, 100)
+        & np.isfinite(ml["porcentaje"].astype(float))
     )
-    entrenables = entrenables.loc[valido].copy()
-    descartadas = len(historial) - len(entrenables)
-    return historial, entrenables, ultimos, rachas, descartadas
+    ml = ml.loc[es_valido].copy()
+    ml["porcentaje_norm"] = ml["porcentaje"].astype(float) / 100.0
+    # No incorporamos nombre, rachas, ni orden global como variables predictivas:
+    # la web no necesariamente contiene todos los envios del juego.
+    return historial, ml, int(len(historial) - len(ml))
 
 
-def nueva_ia() -> RandomForestClassifier:
-    return RandomForestClassifier(
-        n_estimators=200,
-        max_depth=6,
-        min_samples_split=4,
-        min_samples_leaf=2,
-        random_state=42,
-        n_jobs=-1,
-    )
+def columnas_features(df: pd.DataFrame) -> pd.DataFrame:
+    return df[["porcentaje_norm", "stats", "expedicion"]].copy()
 
 
-def probabilidades_victoria(modelo: RandomForestClassifier, X: pd.DataFrame) -> np.ndarray:
-    clase_victoria = list(modelo.classes_).index(1)
-    return modelo.predict_proba(X)[:, clase_victoria]
-
-
-def evaluar_temporalmente(X: pd.DataFrame, df_ml: pd.DataFrame) -> dict[str, Any] | None:
-    """La evaluacion no usa los resultados futuros para ajustar el modelo."""
-    cantidad = len(df_ml)
-    if cantidad < MIN_EVALUACION:
-        return None
-
-    n_prueba = max(8, math.ceil(cantidad * 0.20))
-    corte = cantidad - n_prueba
-    y = df_ml["finalizado_int"].astype(int)
-    X_entreno, X_prueba = X.iloc[:corte], X.iloc[corte:]
-    y_entreno, y_prueba = y.iloc[:corte], y.iloc[corte:]
-
-    if y_entreno.nunique() < 2:
-        return None
-
-    evaluador = nueva_ia()
-    evaluador.fit(X_entreno, y_entreno)
-    probs_ia = probabilidades_victoria(evaluador, X_prueba)
-    pred_ia = (probs_ia >= 0.5).astype(int)
-    probs_oficial = df_ml["porcentaje"].iloc[corte:].to_numpy(dtype=float) / 100.0
-    pred_oficial = (probs_oficial >= 0.5).astype(int)
-    matriz = confusion_matrix(y_prueba, pred_ia, labels=[0, 1])
-
-    brier_ia = float(brier_score_loss(y_prueba, probs_ia))
-    brier_oficial = float(brier_score_loss(y_prueba, probs_oficial))
+def modelos_candidatos() -> dict[str, Pipeline]:
+    log_solo = Pipeline([
+        ("prep", ColumnTransformer([
+            ("pct", StandardScaler(), ["porcentaje_norm"]),
+        ], remainder="drop")),
+        ("modelo", LogisticRegression(C=1.0, max_iter=1000)),
+    ])
+    log_mapa = Pipeline([
+        ("prep", ColumnTransformer([
+            ("num", StandardScaler(), ["porcentaje_norm", "stats"]),
+            ("mapa", OneHotEncoder(handle_unknown="ignore"), ["expedicion"]),
+        ], remainder="drop")),
+        ("modelo", LogisticRegression(C=0.4, max_iter=1000)),
+    ])
+    bosque = Pipeline([
+        ("prep", ColumnTransformer([
+            ("num", "passthrough", ["porcentaje_norm", "stats"]),
+            ("mapa", OneHotEncoder(handle_unknown="ignore"), ["expedicion"]),
+        ], remainder="drop")),
+        ("modelo", RandomForestClassifier(
+            n_estimators=160, max_depth=4, min_samples_leaf=8,
+            max_features=0.8, random_state=42, n_jobs=-1,
+        )),
+    ])
     return {
-        "metodo": "ultimas expediciones reservadas, en orden cronologico",
-        "expediciones_entrenamiento": int(corte),
-        "expediciones_prueba": int(n_prueba),
-        "exactitud_ia_porc": round(float(accuracy_score(y_prueba, pred_ia)) * 100, 2),
-        "exactitud_oficial_porc": round(float(accuracy_score(y_prueba, pred_oficial)) * 100, 2),
-        "brier_ia": round(brier_ia, 5),
-        "brier_oficial": round(brier_oficial, 5),
-        "ia_supero_porcentaje_oficial": brier_ia < brier_oficial,
-        "matriz_confusion_ia": {
+        "logistica_porcentaje": log_solo,
+        "logistica_mapa": log_mapa,
+        "random_forest": bosque,
+    }
+
+
+def predecir_prob(modelo: Pipeline | None, X: pd.DataFrame) -> np.ndarray:
+    if modelo is None:
+        return X["porcentaje_norm"].astype(float).to_numpy()
+    indice = list(modelo.classes_).index(1)
+    return modelo.predict_proba(X)[:, indice]
+
+
+def resumen_predicciones(y_true: np.ndarray, prob: np.ndarray) -> dict[str, Any]:
+    prob = np.clip(np.asarray(prob, dtype=float), 0, 1)
+    cls = (prob >= 0.5).astype(int)
+    y_true = np.asarray(y_true, dtype=int)
+    matriz = confusion_matrix(y_true, cls, labels=[0, 1])
+    return {
+        "exactitud_porc": round(100 * float(accuracy_score(y_true, cls)), 2),
+        "brier": round(float(brier_score_loss(y_true, prob)), 5),
+        "log_loss": round(float(log_loss(y_true, np.clip(prob, 1e-6, 1 - 1e-6), labels=[0, 1])), 5),
+        "matriz_confusion": {
             "verdaderos_negativos": int(matriz[0, 0]),
             "falsos_positivos": int(matriz[0, 1]),
             "falsos_negativos": int(matriz[1, 0]),
             "verdaderos_positivos": int(matriz[1, 1]),
         },
-        "nota": "Brier menor es mejor. Una sola particion temporal no prueba superioridad estadistica.",
     }
 
 
+def validacion_progresiva(ml: pd.DataFrame) -> dict[str, Any] | None:
+    """Evaluacion interna SOLO en la parte anterior al holdout final."""
+    if len(ml) < N_INICIAL_VALIDACION + 40:
+        return None
+    X = columnas_features(ml)
+    y = ml["finalizado_int"].astype(int)
+    estimaciones: dict[str, list[float]] = {**{k: [] for k in modelos_candidatos()}, "porcentaje_referencia": []}
+    reales: list[int] = []
+    for corte in range(N_INICIAL_VALIDACION, len(ml), PASO_VALIDACION):
+        fin = min(corte + PASO_VALIDACION, len(ml))
+        y_train = y.iloc[:corte]
+        if y_train.nunique() != 2:
+            continue
+        y_batch = y.iloc[corte:fin]
+        reales.extend(y_batch.tolist())
+        estimaciones["porcentaje_referencia"].extend(X.iloc[corte:fin]["porcentaje_norm"].tolist())
+        for nombre, plantilla in modelos_candidatos().items():
+            estimador = clone(plantilla)
+            estimador.fit(X.iloc[:corte], y_train)
+            estimaciones[nombre].extend(predecir_prob(estimador, X.iloc[corte:fin]).tolist())
+    if len(reales) < 40:
+        return None
+    y_arr = np.asarray(reales, dtype=int)
+    puntajes = {k: resumen_predicciones(y_arr, np.asarray(v)) for k, v in estimaciones.items()}
+    return {"numero_evaluado": len(reales), "resultados": puntajes}
+
+
+def seleccionar_modelo(puntuaciones: dict[str, Any] | None) -> str:
+    """Guardarrail: preferir la referencia si no hay ganancia clara de Brier."""
+    if puntuaciones is None:
+        return "porcentaje_referencia"
+    resultados = puntuaciones["resultados"]
+    br_ref = resultados["porcentaje_referencia"]["brier"]
+    nombres = ["logistica_porcentaje", "logistica_mapa", "random_forest"]
+    mejor = min(nombres, key=lambda nombre: (resultados[nombre]["brier"], nombre))
+    if br_ref - resultados[mejor]["brier"] < UMBRAL_MEJORA_BRIER:
+        return "porcentaje_referencia"
+    # Evitar elegir un modelo que mejore muy poco Brier pero empeore
+    # notablemente la clasificacion binaria sobre los mismos casos.
+    if (resultados[mejor]["exactitud_porc"] + 3
+            < resultados["porcentaje_referencia"]["exactitud_porc"]):
+        return "porcentaje_referencia"
+    return mejor
+
+
+def evaluar_separado(ml: pd.DataFrame) -> tuple[str, dict[str, Any] | None]:
+    """Selecciona en datos anteriores y evalua en el ultimo 20% no usado."""
+    n = len(ml)
+    if n < MIN_SELECCION:
+        return "porcentaje_referencia", None
+    corte = max(N_INICIAL_VALIDACION + 40, math.floor(n * .8))
+    if corte >= n:
+        return "porcentaje_referencia", None
+    primeros, ultimos = ml.iloc[:corte], ml.iloc[corte:]
+    score_eleccion = validacion_progresiva(primeros)
+    elegido = seleccionar_modelo(score_eleccion)
+    X_tr, X_te = columnas_features(primeros), columnas_features(ultimos)
+    y_tr, y_te = primeros["finalizado_int"].astype(int), ultimos["finalizado_int"].to_numpy(dtype=int)
+    if y_tr.nunique() != 2:
+        return "porcentaje_referencia", None
+    if elegido == "porcentaje_referencia":
+        p_ia = predecir_prob(None, X_te)
+    else:
+        modelo = clone(modelos_candidatos()[elegido])
+        modelo.fit(X_tr, y_tr)
+        p_ia = predecir_prob(modelo, X_te)
+    p_ref = predecir_prob(None, X_te)
+    p_frec = np.full(len(y_te), (int(y_tr.sum()) + 2) / (len(y_tr) + 4))
+    met_ia = resumen_predicciones(y_te, p_ia)
+    met_ref = resumen_predicciones(y_te, p_ref)
+    met_frec = resumen_predicciones(y_te, p_frec)
+    p_siempre = np.ones(len(y_te))
+    met_siempre = resumen_predicciones(y_te, p_siempre)
+    reporte = {
+        "metodo": "holdout cronologico (ultimo 20%) sin usar para elegir el modelo",
+        "modelo_seleccionado": elegido,
+        "expediciones_entrenamiento": len(primeros),
+        "expediciones_prueba": len(ultimos),
+        "exactitud_ia_porc": met_ia["exactitud_porc"],
+        "exactitud_oficial_porc": met_ref["exactitud_porc"],  # Campo compatible v2, NO necesariamente oficial.
+        "exactitud_referencia_porc": met_ref["exactitud_porc"],
+        "exactitud_siempre_vive_porc": met_siempre["exactitud_porc"],
+        "brier_ia": met_ia["brier"],
+        "brier_oficial": met_ref["brier"],  # Campo compatible v2.
+        "brier_referencia": met_ref["brier"],
+        "brier_frecuencia": met_frec["brier"],
+        "ia_supero_porcentaje_oficial": met_ia["brier"] < met_ref["brier"],
+        "matriz_confusion_ia": met_ia["matriz_confusion"],
+        "evaluacion_interna": score_eleccion,
+        "nota": (
+            "El porcentaje es el introducido por la web, no necesariamente oficial. "
+            "La seleccion basada en los datos pasados y el holdout historico "
+            "no garantizan mejores resultados futuros."
+        ),
+    }
+    return elegido, reporte
+
+
+def construir_info_hamster(hist: pd.DataFrame) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    ultimos: dict[str, int] = {}
+    derrotas: dict[str, int] = {}
+    partidas: dict[str, int] = {}
+    if hist.empty:
+        return ultimos, derrotas, partidas
+    for _, fila in hist.iterrows():
+        nombre = fila["hamster"]
+        res = int(fila["finalizado_int"])
+        partidas[nombre] = partidas.get(nombre, 0) + 1
+        derrotas[nombre] = derrotas.get(nombre, 0) + 1 if res == 0 else 0
+        ultimos[nombre] = res
+    return ultimos, derrotas, partidas
+
+
 def entrenar_modelo(df: pd.DataFrame) -> Estado:
-    historial, df_ml, ultimo, rachas, descartadas = construir_historial(df)
-    cantidad = len(df_ml)
-    partidas = historial.groupby("hamster").size().to_dict() if not historial.empty else {}
-    base = dict(
-        modelo=None,
-        columnas=[],
-        historial=historial,
-        evaluacion=None,
-        total_entrenamiento=cantidad,
-        filas_descartadas=descartadas,
-        ultimo_por_hamster=ultimo,
-        racha_por_hamster=rachas,
-        partidas_por_hamster=partidas,
-    )
-    if cantidad < MIN_ENTRENAMIENTO:
-        return Estado(
-            **base,
-            estado_modelo=f"Se necesitan al menos {MIN_ENTRENAMIENTO} expediciones validas para entrenar",
-        )
-    if df_ml["finalizado_int"].nunique() < 2:
-        return Estado(**base, estado_modelo="Se necesitan victorias y derrotas para entrenar")
-
-    X = preparar_features(df_ml)
-    evaluacion = evaluar_temporalmente(X, df_ml)
-
-    # Despues de medir, entrenamos el modelo de produccion con TODO el historial.
-    modelo = nueva_ia()
-    modelo.fit(X, df_ml["finalizado_int"].astype(int))
+    hist, ml, descartadas = construir_historial(df)
+    ultimo, derrotas, partidas = construir_info_hamster(hist)
+    nombre = "porcentaje_referencia"
+    evaluacion = None
+    modelo = None
+    status = "referencia_sin_suficientes_datos"
+    if len(ml) >= MIN_ENTRENAMIENTO and ml["finalizado_int"].nunique() == 2:
+        nombre, evaluacion = evaluar_separado(ml)
+        if nombre != "porcentaje_referencia":
+            modelo = clone(modelos_candidatos()[nombre])
+            modelo.fit(columnas_features(ml), ml["finalizado_int"].astype(int))
+            status = "entrenado"
+        else:
+            status = "referencia_preferida_por_validacion" if evaluacion else "referencia_por_pocos_datos"
+    elif len(ml) >= MIN_ENTRENAMIENTO:
+        status = "referencia_una_sola_clase"
     return Estado(
-        modelo=modelo,
-        columnas=list(X.columns),
-        historial=historial,
-        evaluacion=evaluacion,
-        estado_modelo="entrenado",
-        total_entrenamiento=cantidad,
-        filas_descartadas=descartadas,
-        ultimo_por_hamster=ultimo,
-        racha_por_hamster=rachas,
-        partidas_por_hamster=partidas,
+        modelo=modelo, modelo_nombre=nombre, estado_modelo=status,
+        historial=hist, entrenables=len(ml), descartadas=descartadas,
+        evaluacion=evaluacion, ultimo_por_hamster=ultimo,
+        derrotas_por_hamster=derrotas, envios_por_hamster=partidas,
     )
+
+
+def huella_dataframe(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "vacio"
+    ordenado = df.sort_values(["id"], kind="stable") if "id" in df.columns else df
+    valores = ordenado.astype("string").fillna("<NULL>")
+    hashes = pd.util.hash_pandas_object(valores, index=False).to_numpy()
+    return hashlib.sha256("|".join(valores.columns).encode() + hashes.tobytes()).hexdigest()
 
 
 _cache_lock = threading.Lock()
@@ -368,139 +402,143 @@ _cache: dict[str, Any] = {"momento": -float("inf"), "estado": None}
 
 
 def obtener_estado() -> Estado:
-    """Reutiliza el modelo; se vuelve a consultar y entrenar al vencer la cache."""
     with _cache_lock:
         ahora = time.monotonic()
-        if _cache["estado"] is not None and ahora - _cache["momento"] < CACHE_SEGUNDOS:
-            return _cache["estado"]
+        estado_anterior: Estado | None = _cache["estado"]
+        if estado_anterior is not None and ahora - _cache["momento"] < CACHE_SEGUNDOS:
+            return estado_anterior
         try:
             df = consultar_expediciones()
-            estado = entrenar_modelo(df)
+            huella = huella_dataframe(df)
+            if estado_anterior is not None and estado_anterior.huella == huella:
+                _cache["momento"] = time.monotonic()
+                return estado_anterior
+            nuevo = entrenar_modelo(df)
+            nuevo.huella = huella
+            _cache.update({"momento": time.monotonic(), "estado": nuevo})
+            logger.info("modelo=%s filas=%s", nuevo.modelo_nombre, nuevo.entrenables)
+            return nuevo
         except Exception as exc:
-            logger.exception("No fue posible leer el historial o entrenar")
+            logger.exception("Error consultando Supabase / entrenando v3")
+            if estado_anterior is not None:
+                logger.warning("Usando el ultimo modelo valido en cache")
+                _cache["momento"] = time.monotonic()
+                return estado_anterior
             raise HTTPException(
                 status_code=503,
-                detail="No se pudo consultar o procesar Supabase. Revisa el servidor y el esquema.",
+                detail="No se pudo consultar Supabase o entrenar el modelo. Revisa los Logs de Render.",
             ) from exc
-        _cache.update({"momento": time.monotonic(), "estado": estado})
-        return estado
 
 
 @app.get("/")
-def inicio():
-    return {"mensaje": "RollerCoin Expedition AI", "version": "2.0.0", "documentacion": "/docs"}
+def inicio() -> dict[str, Any]:
+    return {"mensaje": "RollerCoin Expedition AI", "version": VERSION, "documentacion": "/docs"}
 
 
 @app.get("/metricas")
-def obtener_metricas():
+def obtener_metricas() -> dict[str, Any]:
     estado = obtener_estado()
-    df_hist = estado.historial
-    if df_hist.empty:
+    h = estado.historial
+    if h.empty:
         return {
-            "metricas": None,
-            "resumen_hamsters": [],
-            "evaluacion_modelo": None,
+            "metricas": None, "resumen_hamsters": [], "evaluacion_modelo": estado.evaluacion,
             "estado_modelo": estado.estado_modelo,
-            "expediciones_entrenables": estado.total_entrenamiento,
-            "expediciones_descartadas": estado.filas_descartadas,
+            "modelo_seleccionado": estado.modelo_nombre,
+            "version_modelo": VERSION, "expediciones_entrenables": estado.entrenables,
+            "expediciones_descartadas": estado.descartadas,
         }
-
-    total_historial = len(df_hist)
-    vivieron = int(df_hist["finalizado_int"].sum())
-    murieron = total_historial - vivieron
-    aciertos, fallos = 0, 0
-
-    if "vive_ia" in df_hist.columns:
-        for _, fila in df_hist.iterrows():
-            estimacion = interpretar_booleano(fila["vive_ia"])
-            if estimacion is None:
+    total = len(h)
+    vivieron = int(h["finalizado_int"].sum())
+    aciertos = 0
+    fallos = 0
+    if "vive_ia" in h.columns:
+        for _, fila in h.iterrows():
+            prediccion = interpretar_booleano(fila["vive_ia"])
+            if prediccion is None:
                 continue
-            if estimacion == int(fila["finalizado_int"]):
+            if prediccion == int(fila["finalizado_int"]):
                 aciertos += 1
             else:
                 fallos += 1
-
-    total_eval = aciertos + fallos
+    n_eval = aciertos + fallos
     resumen = []
-    for hamster, grupo in df_hist.groupby("hamster", sort=False):
-        total = len(grupo)
+    for hamster, grupo in h.groupby("hamster", sort=False):
         victorias = int(grupo["finalizado_int"].sum())
-        resultados = grupo["finalizado_int"].tolist()
-        ultimo = resultados[-1]
+        cuenta = len(grupo)
+        ultimo = int(grupo["finalizado_int"].iloc[-1])
         racha = 0
-        for resultado in reversed(resultados):
-            if resultado != ultimo:
+        for res in reversed(grupo["finalizado_int"].tolist()):
+            if int(res) != ultimo:
                 break
             racha += 1
         resumen.append({
             "hamster": hamster,
-            "total": total,
+            "total": cuenta,
             "victorias": victorias,
-            "derrotas": total - victorias,
-            "winrate": round(victorias / total * 100, 1),
+            "derrotas": cuenta - victorias,
+            "winrate": round(victorias / cuenta * 100, 1),
             "racha_tipo": "VIVIÓ" if ultimo == 1 else "MURIÓ",
             "racha_conteo": racha,
         })
-    resumen.sort(key=lambda fila: fila["total"], reverse=True)
-
+    resumen.sort(key=lambda d: d["total"], reverse=True)
     return {
         "metricas": {
-            "total_partidas": total_historial,
+            "total_partidas": total,
             "vivieron_num": vivieron,
-            "vivieron_porc": round(100 * vivieron / total_historial, 1),
-            "murieron_num": murieron,
-            "murieron_porc": round(100 * murieron / total_historial, 1),
+            "vivieron_porc": round(vivieron / total * 100, 1),
+            "murieron_num": total - vivieron,
+            "murieron_porc": round((total - vivieron) / total * 100, 1),
             "ia_aciertos": aciertos,
             "ia_fallos": fallos,
-            # Campo original para mantener compatibilidad con tu frontend.
-            # En rigor esta medida es accuracy, no precision de clase positiva.
-            "ia_precision_porc": round(100 * aciertos / total_eval, 1) if total_eval else 0.0,
-            "ia_exactitud_porc": round(100 * aciertos / total_eval, 1) if total_eval else None,
-            "ia_predicciones_evaluadas": total_eval,
+            "ia_precision_porc": round(aciertos / n_eval * 100, 1) if n_eval else 0.,
+            "ia_exactitud_porc": round(aciertos / n_eval * 100, 1) if n_eval else None,
+            "ia_predicciones_evaluadas": n_eval,
         },
         "resumen_hamsters": resumen,
         "evaluacion_modelo": estado.evaluacion,
         "estado_modelo": estado.estado_modelo,
-        "expediciones_entrenables": estado.total_entrenamiento,
-        "expediciones_descartadas": estado.filas_descartadas,
+        "modelo_seleccionado": estado.modelo_nombre,
+        "version_modelo": VERSION,
+        "expediciones_entrenables": estado.entrenables,
+        "expediciones_descartadas": estado.descartadas,
+        "nota_historial": "Las rachas son solo de registros guardados, no de todos los envios en RollerCoin.",
+        "nota_precision_historica": "Aciertos acumulados pueden incluir versiones anteriores de la IA.",
     }
 
 
 @app.post("/simular")
-def simular_expedicion(datos: SimulacionInput):
+def simular_expedicion(datos: SimulacionInput) -> dict[str, Any]:
     estado = obtener_estado()
-    if estado.modelo is None:
-        # Se conserva el campo 'error' usado por el frontend anterior.
-        return {"error": estado.estado_modelo}
-
-    hamster = datos.hamster
-    existe = hamster in estado.ultimo_por_hamster
-    df_sim = pd.DataFrame([{
-        **datos.model_dump(),
-        "resultado_anterior": estado.ultimo_por_hamster.get(hamster, 0),
-        "racha_derrotas": estado.racha_por_hamster.get(hamster, 0),
-        "tiene_historial_hamster": int(existe),
+    X = pd.DataFrame([{
+        "porcentaje_norm": datos.porcentaje / 100.0,
+        "stats": datos.stats,
+        "expedicion": datos.expedicion,
     }])
-    X = preparar_features(df_sim).reindex(columns=estado.columnas, fill_value=0)
-    prob_ia = float(probabilidades_victoria(estado.modelo, X)[0]) * 100.0
-    prob_oficial = datos.porcentaje
-
+    prob_ia = round(float(predecir_prob(estado.modelo, X)[0]) * 100, 2)
+    referencia = round(datos.porcentaje, 2)
+    nombre = datos.hamster
+    existe = nombre in estado.ultimo_por_hamster
     return {
-        "probabilidad_ia": round(prob_ia, 2),
-        "vive_ia": "SI" if prob_ia >= 50 else "NO",
-        "probabilidad_oficial": round(prob_oficial, 2),
-        "vive_oficial": "SI" if prob_oficial >= 50 else "NO",
-        "diferencia_puntos": round(prob_ia - prob_oficial, 2),
-        "fatiga_hamster": estado.partidas_por_hamster.get(hamster, 0),
+        "probabilidad_ia": prob_ia,
+        "vive_ia": "SI" if prob_ia >= 50.0 else "NO",
+        "probabilidad_oficial": referencia,  # Alias de compatibilidad con frontend v2/v5.
+        "vive_oficial": "SI" if referencia >= 50.0 else "NO",
+        "probabilidad_referencia": referencia,
+        "diferencia_puntos": round(prob_ia - referencia, 2),
+        "modelo_seleccionado": estado.modelo_nombre,
+        "version_modelo": VERSION,
+        "estado_modelo": estado.estado_modelo,
+        "fatiga_hamster": estado.envios_por_hamster.get(nombre, 0),
         "fatiga_utilizada": False,
-        "nota_fatiga": "Este campo es un conteo de expediciones, NO mide fatiga.",
-        "racha_actual": estado.racha_por_hamster.get(hamster, 0),
-        "resultado_anterior": estado.ultimo_por_hamster.get(hamster) if existe else None,
+        "nota_fatiga": "Conteo de registros, no mide fatiga real.",
+        "racha_actual": estado.derrotas_por_hamster.get(nombre, 0),
+        "racha_utilizada": False,
+        "resultado_anterior": estado.ultimo_por_hamster.get(nombre) if existe else None,
         "hamster_con_historial": existe,
-        "expediciones_entrenables": estado.total_entrenamiento,
+        "expediciones_entrenables": estado.entrenables,
         "evaluacion_disponible": estado.evaluacion is not None,
         "advertencia": (
-            "Estimacion estadistica; no garantiza el resultado. "
-            "Si el porcentaje ingresado es oficial, comparalo con la IA."
+            "El porcentaje de referencia lo proporciona el frontend y puede ser una estimacion. "
+            "Una probabilidad no es una garantia; rachas y envios omitidos no se usan para predecir."
         ),
     }
