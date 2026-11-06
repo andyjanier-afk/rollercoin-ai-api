@@ -1,116 +1,114 @@
+import numpy as np
 import pandas as pd
-import pytest
-from pydantic import ValidationError
-
-from main import (
-    SimulacionInput, interpretar_booleano, construir_historial, preparar_features,
-    entrenar_modelo, probabilidades_victoria,
-)
+from fastapi.testclient import TestClient
+import main
 
 
-def ejemplo(n=40):
+def muestra(n=175):
+    rng = np.random.default_rng(12)
     filas = []
     for i in range(n):
+        p = float(rng.uniform(20, 84))
         filas.append({
             "id": i + 1,
-            "fecha": f"2026-01-{(i % 28) + 1:02d}",
-            "hamster": "A" if i % 2 == 0 else "B",
-            "expedicion": "3h" if i % 3 == 0 else "12h",
-            "stats": 120 + i,
-            "porcentaje": 70 if i % 3 else 30,
-            "finalizado": i % 3 != 0,
-            "vive_ia": "SI" if i % 2 else "NO",
+            "fecha": f"2026-10-{(i // 10) % 28 + 1:02d}",
+            "hamster": ["Cuscuz", "Mamita", "Banjo Walker"][i % 3],
+            "expedicion": ["3h", "18h", "24h Dark", "30h"][i % 4],
+            "stats": int(rng.integers(120, 275)),
+            "porcentaje": p,
+            "finalizado": bool(rng.random() < p / 100),
+            "vive_ia": "SI" if i % 2 else None
         })
     return pd.DataFrame(filas)
 
 
-def test_booleanos_y_pendientes():
-    assert interpretar_booleano(True) == 1
-    assert interpretar_booleano("true") == 1
-    assert interpretar_booleano("1.0") == 1
-    assert interpretar_booleano(False) == 0
-    assert interpretar_booleano("NO") == 0
-    assert interpretar_booleano(None) is None
-    assert interpretar_booleano("pendiente") is None
+def test_pendientes_y_booleanos():
+    assert main.interpretar_booleano(None) is None
+    assert main.interpretar_booleano("") is None
+    assert main.interpretar_booleano(False) == 0
+    assert main.interpretar_booleano("false") == 0
+    assert main.interpretar_booleano(True) == 1
+    assert main.interpretar_booleano("true") == 1
 
 
-def test_rachas_separadas_por_hamster():
-    df = ejemplo(4)
-    df["hamster"] = ["A", "B", "A", "B"]
-    df["finalizado"] = [False, True, False, False]
-    hist, datos, ultimos, rachas, _ = construir_historial(df)
-    assert hist["racha_derrotas"].tolist() == [0, 0, 1, 0]
-    assert hist["resultado_anterior"].tolist() == [0, 0, 0, 1]
-    assert rachas == {"A": 2, "B": 1}
-    assert ultimos == {"A": 0, "B": 0}
-    assert len(datos) == 4
+def test_features_y_escala_porcentaje():
+    hist, datos, descartadas = main.construir_historial(muestra(20))
+    X = main.columnas_features(datos)
+    assert list(X.columns) == ["porcentaje_norm", "stats", "expedicion"]
+    assert np.allclose(X.porcentaje_norm.to_numpy(), datos.porcentaje.to_numpy() / 100)
+    assert len(hist) == len(datos) == 20 and descartadas == 0
 
 
-def test_porcentaje_no_se_confunde_con_fraccion():
-    df = pd.DataFrame([{
-        "hamster": "A", "expedicion": "3h", "stats": 10,
-        "porcentaje": 0.8,
-    }])
-    X = preparar_features(df)
-    assert X.iloc[0]["porcentaje_norm"] == pytest.approx(0.008)
+def test_resultados_pendientes_no_se_usan():
+    df = muestra(20)
+    df["finalizado"] = df.finalizado.astype(object)
+    df.loc[0, "finalizado"] = None
+    hist, datos, _ = main.construir_historial(df)
+    assert len(hist) == len(datos) == 19
 
 
-def test_una_clase_no_entrena():
-    df = ejemplo(40)
-    df["finalizado"] = True
-    estado = entrenar_modelo(df)
-    assert estado.modelo is None
-    assert "victorias y derrotas" in estado.estado_modelo
+def test_seleccion_temporal_y_holdout():
+    e = main.entrenar_modelo(muestra())
+    assert e.evaluacion is not None
+    assert e.evaluacion["expediciones_prueba"] > 0
+    assert e.evaluacion["expediciones_entrenamiento"] + e.evaluacion["expediciones_prueba"] == 175
+    assert e.modelo_nombre in {"porcentaje_referencia", "logistica_porcentaje", "logistica_mapa", "random_forest"}
 
 
-def test_modelo_entrena_y_evalua():
-    estado = entrenar_modelo(ejemplo(40))
-    assert estado.modelo is not None
-    assert estado.evaluacion is not None
-    assert estado.evaluacion["expediciones_prueba"] == 8
-    df = pd.DataFrame([{
-        "hamster": "A", "expedicion": "3h", "stats": 160,
-        "porcentaje": 70,
-    }])
-    X = preparar_features(df).reindex(columns=estado.columnas, fill_value=0)
-    prob = probabilidades_victoria(estado.modelo, X)[0]
-    assert 0 <= prob <= 1
+def test_historial_pequeno_usa_referencia():
+    e = main.entrenar_modelo(muestra(8))
+    assert e.modelo is None
+    assert e.modelo_nombre == "porcentaje_referencia"
 
 
-def test_input_invalido():
-    with pytest.raises(ValidationError):
-        SimulacionInput(hamster="A", stats=10, expedicion="inexistente", porcentaje=60)
-    with pytest.raises(ValidationError):
-        SimulacionInput(hamster="A", stats=10, expedicion="3h", porcentaje=101)
-
-
-def test_endpoints_con_modelo_en_cache(monkeypatch):
-    import time
-    from fastapi.testclient import TestClient
-    import main
-
-    estado = entrenar_modelo(ejemplo(40))
-    monkeypatch.setattr(main, "_cache", {"momento": time.monotonic(), "estado": estado})
-    cliente = TestClient(main.app)
-
-    respuesta = cliente.get("/metricas")
-    assert respuesta.status_code == 200
-    met = respuesta.json()
-    assert met["metricas"]["total_partidas"] == 40
-    assert met["evaluacion_modelo"]["expediciones_prueba"] == 8
-    assert met["metricas"]["ia_predicciones_evaluadas"] == 40
-
-    simulacion = cliente.post("/simular", json={
-        "hamster": "A", "stats": 100, "expedicion": "3h", "porcentaje": 77
+def test_endpoints_frontend_sin_supabase_real(monkeypatch):
+    e = main.entrenar_modelo(muestra())
+    monkeypatch.setattr(main, "obtener_estado", lambda: e)
+    client = TestClient(main.app)
+    assert client.get("/").json()["version"] == "3.0.0"
+    m = client.get("/metricas")
+    assert m.status_code == 200
+    assert m.json()["metricas"]["total_partidas"] == 175
+    r = client.post("/simular", json={
+        "hamster": "Cuscuz", "stats": 255, "expedicion": "30h", "porcentaje": 67.2
     })
-    assert simulacion.status_code == 200
-    datos = simulacion.json()
-    assert datos["probabilidad_oficial"] == 77.0
-    assert datos["fatiga_utilizada"] is False
-    assert datos["hamster_con_historial"] is True
-    assert 0 <= datos["probabilidad_ia"] <= 100
+    assert r.status_code == 200
+    p = r.json()
+    assert p["probabilidad_oficial"] == 67.2
+    assert 0 <= p["probabilidad_ia"] <= 100
+    assert p["vive_ia"] in ("SI", "NO")
+    for k in ("version_modelo", "modelo_seleccionado", "racha_actual", "diferencia_puntos"):
+        assert k in p
 
-    malo = cliente.post("/simular", json={
-        "hamster": "A", "stats": 100, "expedicion": "invalido", "porcentaje": 77
+
+def test_nombre_no_se_usa_para_modificar_probabilidad(monkeypatch):
+    e = main.entrenar_modelo(muestra())
+    monkeypatch.setattr(main, "obtener_estado", lambda: e)
+    c = TestClient(main.app)
+    datos = {"hamster": "Cuscuz", "stats": 210, "expedicion": "18h", "porcentaje": 60}
+    a = c.post("/simular", json=datos).json()["probabilidad_ia"]
+    b = c.post("/simular", json={**datos, "hamster": "Mamita"}).json()["probabilidad_ia"]
+    assert a == b
+
+
+def test_mapa_invalido_rechazado():
+    r = TestClient(main.app).post("/simular", json={
+        "hamster": "Cuscuz", "stats": 220, "expedicion": "Lost Shrine", "porcentaje": 65
     })
-    assert malo.status_code == 422
+    assert r.status_code == 422
+
+
+def test_cache_si_historial_no_cambia(monkeypatch):
+    df = muestra(8)
+    llamadas = []
+    def consulta():
+        llamadas.append(1)
+        return df.copy()
+    monkeypatch.setattr(main, "consultar_expediciones", consulta)
+    monkeypatch.setattr(main, "CACHE_SEGUNDOS", 0)
+    main._cache.update({"momento": -float("inf"), "estado": None})
+    e1 = main.obtener_estado()
+    e2 = main.obtener_estado()
+    assert e1 is e2
+    assert len(llamadas) == 2
+    main._cache.update({"momento": -float("inf"), "estado": None})
