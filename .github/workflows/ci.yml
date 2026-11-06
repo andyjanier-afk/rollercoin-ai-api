@@ -1,0 +1,24 @@
+name: Validar API RollerCoin
+
+on:
+  push:
+    branches: [main, rollercoin-ai-v3-evaluacion]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pruebas:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+      - name: Comprobar sintaxis
+        run: python -m compileall -q main.py
+      - name: Ejecutar pruebas
+        run: python -m pytest -q tests
