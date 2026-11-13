@@ -106,9 +106,57 @@ def test_cache_si_historial_no_cambia(monkeypatch):
         return df.copy()
     monkeypatch.setattr(main, "consultar_expediciones", consulta)
     monkeypatch.setattr(main, "CACHE_SEGUNDOS", 0)
-    main._cache.update({"momento": -float("inf"), "estado": None})
+    main._cache.update({"momento": -float("inf"), "estado": None, "actualizando": False})
+    main._cache_listo.clear()
     e1 = main.obtener_estado()
+    assert e1.modelo_nombre == "porcentaje_referencia"
     e2 = main.obtener_estado()
-    assert e1 is e2
+    assert e2 is e1
+    assert main._cache_listo.wait(timeout=10)
     assert len(llamadas) == 2
-    main._cache.update({"momento": -float("inf"), "estado": None})
+    assert main.obtener_estado() is e1
+    assert main._cache_listo.wait(timeout=10)
+    main._cache.update({"momento": -float("inf"), "estado": None, "actualizando": False})
+    main._cache_listo.clear()
+
+
+def test_actualizar_sin_repetir_validacion_costosa(monkeypatch):
+    anterior = main.entrenar_modelo(muestra(175))
+    assert anterior.evaluacion is not None
+    assert anterior.seleccion_evaluada_con == 175
+    df = muestra(176)
+    monkeypatch.setattr(main, "REVALIDAR_CADA", 25)
+    def prohibida(_):
+        raise AssertionError("La validación completa no debe repetirse con cada resultado")
+    monkeypatch.setattr(main, "evaluar_separado", prohibida)
+    nuevo = main.entrenar_modelo(df, anterior=anterior)
+    assert nuevo.entrenables == 176
+    assert nuevo.modelo_nombre == anterior.modelo_nombre
+    assert nuevo.seleccion_evaluada_con == 175
+    assert nuevo.modelo is not None or anterior.modelo is None
+
+
+def test_no_bloquea_consultas_mientras_actualiza(monkeypatch):
+    import threading
+    started = threading.Event()
+    resume = threading.Event()
+    previous = main.entrenar_modelo(muestra(8))
+    previous.huella = "anterior"
+    def lenta():
+        started.set()
+        assert resume.wait(timeout=5)
+        return muestra(9)
+    monkeypatch.setattr(main, "consultar_expediciones", lenta)
+    monkeypatch.setattr(main, "CACHE_SEGUNDOS", 0)
+    main._cache.update({"momento": -float("inf"), "estado": previous, "actualizando": False})
+    main._cache_listo.set()
+    try:
+        received = main.obtener_estado()
+        assert received is previous
+        assert started.wait(timeout=2)
+        assert main.obtener_estado() is previous
+    finally:
+        resume.set()
+        assert main._cache_listo.wait(timeout=10)
+        main._cache.update({"momento": -float("inf"), "estado": None, "actualizando": False})
+        main._cache_listo.clear()
