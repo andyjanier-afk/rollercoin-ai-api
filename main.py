@@ -45,6 +45,7 @@ CORS_ORIGINS = [
     ).split(",") if x.strip()
 ]
 CACHE_SEGUNDOS = max(0, int(os.getenv("CACHE_SEGUNDOS", "15")))
+REVALIDAR_CADA = max(10, int(os.getenv("REVALIDAR_CADA", "25")))
 PAGINA = 1000
 MIN_ENTRENAMIENTO = 30
 MIN_SELECCION = 145
@@ -109,6 +110,7 @@ class Estado:
     derrotas_por_hamster: dict[str, int]
     envios_por_hamster: dict[str, int]
     huella: str = ""
+    seleccion_evaluada_con: int = 0
 
 
 def interpretar_booleano(valor: Any) -> int | None:
@@ -363,15 +365,30 @@ def construir_info_hamster(hist: pd.DataFrame) -> tuple[dict[str, int], dict[str
     return ultimos, derrotas, partidas
 
 
-def entrenar_modelo(df: pd.DataFrame) -> Estado:
+def entrenar_modelo(df: pd.DataFrame, anterior: Estado | None = None) -> Estado:
+    """Reajusta el modelo con cada resultado; no repite la evaluación costosa en cada envío."""
     hist, ml, descartadas = construir_historial(df)
     ultimo, derrotas, partidas = construir_info_hamster(hist)
     nombre = "porcentaje_referencia"
     evaluacion = None
     modelo = None
+    seleccion_evaluada_con = 0
     status = "referencia_sin_suficientes_datos"
     if len(ml) >= MIN_ENTRENAMIENTO and ml["finalizado_int"].nunique() == 2:
-        nombre, evaluacion = evaluar_separado(ml)
+        puede_reutilizar = (
+            anterior is not None
+            and anterior.evaluacion is not None
+            and anterior.seleccion_evaluada_con > 0
+            and 0 <= len(ml) - anterior.seleccion_evaluada_con < REVALIDAR_CADA
+        )
+        if puede_reutilizar:
+            # Se conservan los resultados históricos de evaluación hasta el siguiente corte.
+            nombre = anterior.modelo_nombre
+            evaluacion = anterior.evaluacion
+            seleccion_evaluada_con = anterior.seleccion_evaluada_con
+        else:
+            nombre, evaluacion = evaluar_separado(ml)
+            seleccion_evaluada_con = len(ml)
         if nombre != "porcentaje_referencia":
             modelo = clone(modelos_candidatos()[nombre])
             modelo.fit(columnas_features(ml), ml["finalizado_int"].astype(int))
@@ -385,6 +402,7 @@ def entrenar_modelo(df: pd.DataFrame) -> Estado:
         historial=hist, entrenables=len(ml), descartadas=descartadas,
         evaluacion=evaluacion, ultimo_por_hamster=ultimo,
         derrotas_por_hamster=derrotas, envios_por_hamster=partidas,
+        seleccion_evaluada_con=seleccion_evaluada_con,
     )
 
 
@@ -398,36 +416,78 @@ def huella_dataframe(df: pd.DataFrame) -> str:
 
 
 _cache_lock = threading.Lock()
-_cache: dict[str, Any] = {"momento": -float("inf"), "estado": None}
+_cache_listo = threading.Event()
+_cache: dict[str, Any] = {
+    "momento": -float("inf"), "estado": None, "actualizando": False,
+}
+
+
+def _recargar_cache() -> None:
+    """Consulta Supabase y entrena fuera del hilo que responde las predicciones."""
+    try:
+        df = consultar_expediciones()
+        huella = huella_dataframe(df)
+        with _cache_lock:
+            anterior: Estado | None = _cache["estado"]
+        if anterior is not None and anterior.huella == huella:
+            return
+        inicio = time.monotonic()
+        nuevo = entrenar_modelo(df, anterior=anterior)
+        nuevo.huella = huella
+        with _cache_lock:
+            _cache["estado"] = nuevo
+        logger.info(
+            "modelo=%s filas=%s entrenamiento_segundos=%.2f",
+            nuevo.modelo_nombre, nuevo.entrenables, time.monotonic() - inicio,
+        )
+    except Exception:
+        logger.exception("Error consultando Supabase / entrenando v3")
+        with _cache_lock:
+            if _cache["estado"] is not None:
+                logger.warning("Se conserva el ultimo modelo valido en cache")
+    finally:
+        with _cache_lock:
+            _cache["momento"] = time.monotonic()
+            _cache["actualizando"] = False
+            _cache_listo.set()
+
+
+def _iniciar_recarga() -> None:
+    with _cache_lock:
+        if _cache["actualizando"]:
+            return
+        _cache["actualizando"] = True
+        _cache_listo.clear()
+    threading.Thread(target=_recargar_cache, name="rollercoin-reentrenar", daemon=True).start()
 
 
 def obtener_estado() -> Estado:
     with _cache_lock:
-        ahora = time.monotonic()
-        estado_anterior: Estado | None = _cache["estado"]
-        if estado_anterior is not None and ahora - _cache["momento"] < CACHE_SEGUNDOS:
-            return estado_anterior
-        try:
-            df = consultar_expediciones()
-            huella = huella_dataframe(df)
-            if estado_anterior is not None and estado_anterior.huella == huella:
-                _cache["momento"] = time.monotonic()
-                return estado_anterior
-            nuevo = entrenar_modelo(df)
-            nuevo.huella = huella
-            _cache.update({"momento": time.monotonic(), "estado": nuevo})
-            logger.info("modelo=%s filas=%s", nuevo.modelo_nombre, nuevo.entrenables)
-            return nuevo
-        except Exception as exc:
-            logger.exception("Error consultando Supabase / entrenando v3")
-            if estado_anterior is not None:
-                logger.warning("Usando el ultimo modelo valido en cache")
-                _cache["momento"] = time.monotonic()
-                return estado_anterior
-            raise HTTPException(
-                status_code=503,
-                detail="No se pudo consultar Supabase o entrenar el modelo. Revisa los Logs de Render.",
-            ) from exc
+        anterior: Estado | None = _cache["estado"]
+        actualizar = (not _cache["actualizando"]
+                      and (anterior is None or time.monotonic() - _cache["momento"] >= CACHE_SEGUNDOS))
+    if actualizar:
+        _iniciar_recarga()
+    # Si hay un modelo en memoria, la consulta es inmediata.
+    # Una actualización concurrente nunca detiene /simular ni /metricas.
+    if anterior is not None:
+        return anterior
+    # Primera carga de Render: es necesario obtener un modelo real.
+    _cache_listo.wait(timeout=60)
+    with _cache_lock:
+        listo: Estado | None = _cache["estado"]
+    if listo is not None:
+        return listo
+    raise HTTPException(
+        status_code=503,
+        detail="La IA todavía se está preparando. Vuelve a consultar en unos momentos.",
+    )
+
+
+@app.on_event("startup")
+def precargar_ia() -> None:
+    # Render inicia el entrenamiento una sola vez al arrancar, antes de recibir tráfico.
+    _iniciar_recarga()
 
 
 @app.get("/")
